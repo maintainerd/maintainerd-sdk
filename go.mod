@@ -11,6 +11,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/maintainerd/core v0.0.0-00010101000000-000000000000
 	github.com/maintainerd/docker v0.0.0-00010101000000-000000000000
+	github.com/maintainerd/secret v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.83.1
 )
 
@@ -23,3 +24,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
+
+replace github.com/maintainerd/secret => ../maintainerd-secret

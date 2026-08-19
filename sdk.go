@@ -21,6 +21,7 @@ import (
 	"github.com/maintainerd/sdk/auth"
 	"github.com/maintainerd/sdk/core"
 	"github.com/maintainerd/sdk/runtime"
+	"github.com/maintainerd/sdk/secret"
 )
 
 // Config configures the SDK client. Only the services whose addresses are set
@@ -28,6 +29,7 @@ import (
 type Config struct {
 	RuntimeAddr  string // maintainerd-docker RuntimeService (e.g. "localhost:9090")
 	CoreAddr     string // maintainerd-core AgentGateway (e.g. "localhost:8081")
+	SecretAddr   string // maintainerd-secret SecretService (e.g. "localhost:9092")
 	AuthJWKSURL  string // system-Auth JWKS URL for token verification
 	AuthIssuer   string // optional issuer check
 	AuthAudience string // optional audience check
@@ -46,6 +48,7 @@ type Config struct {
 type Client struct {
 	Runtime *runtime.Client
 	Core    *core.Client
+	Secret  *secret.Client
 	Auth    *auth.Verifier
 
 	conns []*grpc.ClientConn
@@ -81,6 +84,15 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		}
 		cl.conns = append(cl.conns, conn)
 		cl.Core = core.New(conn)
+	}
+	if cfg.SecretAddr != "" {
+		conn, err := grpc.NewClient(cfg.SecretAddr, base...)
+		if err != nil {
+			_ = cl.Close()
+			return nil, err
+		}
+		cl.conns = append(cl.conns, conn)
+		cl.Secret = secret.New(conn)
 	}
 	if cfg.AuthJWKSURL != "" {
 		v, err := auth.NewVerifier(ctx, cfg.AuthJWKSURL, cfg.AuthIssuer, cfg.AuthAudience)
