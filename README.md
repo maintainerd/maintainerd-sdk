@@ -13,11 +13,14 @@ There are two distinct concerns; keep them separate:
    `sdk.Core.PullWork(...)`, `sdk.Auth.Verify(token)`. Handles connections,
    **credentials (the IAM token — AWS SigV4's role)**, and typed results. Used by
    external apps *and* by maintainerd services calling each other.
-2. **Service kit — separate module (`.../kit`, planned).** The DRY *server-side*
-   framework services share so they stop copy-pasting: config, logging, health,
-   graceful shutdown, server bootstrap, the auth **PEP** middleware, the secret
-   provider, and the setup/controller pattern. (AWS keeps this internal; it is
-   not the public SDK.)
+2. **Service kit — its own repo, [`maintainerd-kit`](https://github.com/maintainerd/maintainerd-kit)
+   (`github.com/maintainerd/kit`).** The DRY *server-side* framework services
+   share so they stop copy-pasting: config, logging, health, graceful shutdown,
+   server bootstrap, the auth **PEP** middleware (`kit/authz`), the secret
+   provider, and the setup/controller pattern. Split out of this repo because an
+   SDK and a service framework are different products with different consumers
+   and release cadences. This repo (the sdk) provides the token **verifier**
+   (`sdk/auth`); the kit provides the **middleware** that uses it.
 
 ## Client SDK
 
