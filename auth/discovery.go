@@ -19,6 +19,8 @@ type Provider struct {
 	JWKSURI               string `json:"jwks_uri"`
 	UserinfoEndpoint      string `json:"userinfo_endpoint"`
 	EndSessionEndpoint    string `json:"end_session_endpoint"`
+	IntrospectionEndpoint string `json:"introspection_endpoint"` // RFC 7662 (auth.Introspect)
+	RevocationEndpoint    string `json:"revocation_endpoint"`    // RFC 7009 (auth.Revoke)
 }
 
 // Discover fetches the OIDC discovery document from an issuer base URL
