@@ -74,6 +74,26 @@ func (v *Verifier) Verify(token string) (*Claims, error) {
 	return c, nil
 }
 
+// HasScope reports whether the token carries the given scope/permission.
+func (c *Claims) HasScope(scope string) bool {
+	for _, s := range c.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// HasAnyScope reports whether the token carries at least one of the scopes.
+func (c *Claims) HasAnyScope(scopes ...string) bool {
+	for _, s := range scopes {
+		if c.HasScope(s) {
+			return true
+		}
+	}
+	return false
+}
+
 type ctxKey struct{}
 
 // FromContext returns the Claims placed by Middleware, if any.
@@ -98,6 +118,20 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, claims)))
+	})
+}
+
+// RequireScope wraps a handler so it runs only when the verified token (placed
+// by Middleware) carries the given scope; otherwise it 403s. Chain it after
+// Middleware: v.Middleware(auth.RequireScope("core:admin", handler)).
+func RequireScope(scope string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := FromContext(r.Context())
+		if !ok || !claims.HasScope(scope) {
+			http.Error(w, `{"error":"insufficient scope"}`, http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
