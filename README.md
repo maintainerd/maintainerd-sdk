@@ -1,51 +1,54 @@
 # maintainerd-sdk
 
 The **client SDK** for maintainerd — the one library external apps and
-maintainerd's own services import to **call** maintainerd services (the
-`aws-sdk-go` / `boto3` analog). It wires typed service clients, attaches
+maintainerd's own services import to **call** maintainerd's **product services**
+(the `aws-sdk-go` / `boto3` analog). It wires typed service clients, attaches
 identity, and verifies system-Auth (IAM) tokens.
 
-## What "SDK" means here (and what it doesn't)
+## Scope — product services, not the control plane
 
-There are two distinct concerns; keep them separate:
+The SDK exposes the services an app **consumes** — auth (verify), secret, and
+future ones (storage, database, …) — exactly the AWS line: `aws-sdk-go` ships
+S3/DynamoDB clients, **not** AWS's internal control plane. So the SDK does **not**
+contain core's AgentGateway, the docker runtime, orchestration, or setup — those
+are internal wiring that lives in the consuming service (e.g. the agent) or in
+the internal [`maintainerd-kit`](https://github.com/maintainerd/maintainerd-kit),
+never here.
 
-1. **Client SDK — this repo.** How apps *call* services: `sdk.Runtime.Run(...)`,
-   `sdk.Core.PullWork(...)`, `sdk.Auth.Verify(token)`. Handles connections,
-   **credentials (the IAM token — AWS SigV4's role)**, and typed results. Used by
-   external apps *and* by maintainerd services calling each other.
-2. **Service kit — its own repo, [`maintainerd-kit`](https://github.com/maintainerd/maintainerd-kit)
-   (`github.com/maintainerd/kit`).** The DRY *server-side* framework services
-   share so they stop copy-pasting: config, logging, health, graceful shutdown,
-   server bootstrap, the auth **PEP** middleware (`kit/authz`), the secret
-   provider, and the setup/controller pattern. Split out of this repo because an
-   SDK and a service framework are different products with different consumers
-   and release cadences. This repo (the sdk) provides the token **verifier**
-   (`sdk/auth`); the kit provides the **middleware** that uses it.
+Two distinct concerns, kept separate:
 
-## Client SDK
+1. **Client SDK — this repo.** How apps *call* product services and authenticate.
+   Used by external apps *and* by maintainerd services.
+2. **Service kit — [`maintainerd-kit`](https://github.com/maintainerd/maintainerd-kit)
+   (`github.com/maintainerd/kit`).** The DRY *server-side* framework (config,
+   logging, server bootstrap, the auth **PEP** middleware, secret provider, setup)
+   — how you *build & operate* a service. Different product, different consumers.
+
+## Usage
 
 ```go
 client, _ := sdk.New(ctx, sdk.Config{
-    RuntimeAddr: "localhost:9090",           // maintainerd-docker
-    CoreAddr:    "localhost:8081",           // maintainerd-core
+    SecretAddr:  "localhost:9092",             // maintainerd-secret (a product service)
     AuthJWKSURL: "https://auth.local/.well-known/jwks.json",
     Credentials: sdk.StaticToken(serviceToken), // attached to every call
 })
 defer client.Close()
 
-id, _ := client.Runtime.Run(ctx, runtime.Spec{Image: "nginx:alpine", Name: "web"})
-work, _ := client.Core.PullWork(ctx, agentUUID, 10)
+val, _ := client.Secret.Get(ctx, "db/password")
 ```
 
-### Identity — the IAM plumbing
+### Identity — verifying and authenticating
 
-- **Callers attach a token** via `Credentials` (the SigV4 analog). Under
-  maintainerd, that's a **system-Auth (IAM)** token; standalone, a service or
-  end-user token.
 - **Callees verify** with `client.Auth` (or `auth.Verifier`): a JWKS/JWT check
-  against Auth's public keys — the **PEP** that makes "attached services are
-  governed by system Auth" real. It needs only Auth's JWKS URL, never the Auth
-  codebase.
+  against Auth's public keys. It needs only Auth's JWKS URL, never the Auth
+  codebase. `Claims.HasScope` + `auth.RequireScope` authorize, not just
+  authenticate.
+- **Callers attach a token** via `Credentials` (the SigV4 analog):
+  - `StaticToken` / `Anonymous`
+  - `ClientCredentials` — OAuth2 client_credentials (a secret-holding client)
+  - `PrivateKeyJWT` — RFC 7523 client assertion (the client keeps the private
+    key; Auth holds only the public JWKS)
+- **`auth.Discover`** resolves Auth's endpoints from its issuer (no hardcoding).
 
 ```go
 // protect an HTTP surface with system-Auth
@@ -54,10 +57,10 @@ mux.Handle("/api/", client.Auth.Middleware(apiHandler))
 
 ## Packages
 
-- `sdk` — the aggregate `Client`, `Config`, `Credentials`
-- `sdk/runtime` — client for maintainerd-docker `RuntimeService`
-- `sdk/core` — client for maintainerd-core `AgentGateway`
-- `sdk/auth` — system-Auth (IAM) token verification + HTTP middleware
+- `sdk` — the aggregate `Client`, `Config`, `Credentials`, token sources
+  (`StaticToken`, `Anonymous`, `ClientCredentials`, `PrivateKeyJWT`)
+- `sdk/secret` — client for maintainerd-secret `SecretService`
+- `sdk/auth` — token verification, scope checks, HTTP middleware, OIDC discovery
 
 ## Multi-repo note
 
