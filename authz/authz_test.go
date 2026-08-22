@@ -25,15 +25,28 @@ const prodPassword = "mrn:secret:acme:billing:secret/prod/db/PASSWORD"
 // testMap is the permission table the guard tests enforce against.
 var testMap = Map{
 	Prefix: "/api/v1/",
+	// Exact wins over the segment pair; these are the surfaces whose real privilege
+	// the "secrets" pair below could never express.
+	Exact: map[string]Rule{
+		"POST /api/v1/secrets/reveal": {Permission: permGetSecret},
+		"POST /api/v1/secrets":        {Permission: permPutSecret},
+		"POST /api/v1/secrets/purge":  {Permission: permDeleteSecret, Actor: ActorUserOnly},
+		"POST /api/v1/secrets/fetch":  {Permission: permGetSecret, Actor: ActorServiceOnly},
+		"GET /api/v1/secrets/open":    {Permission: ""},
+	},
 	Routes: map[string]Perms{
-		"projects": {Read: permReadMetadata, Write: permManageFolder},
+		"projects": {Read: permReadMetadata, Write: permManageFolder, WriteActor: ActorUserOnly},
 		"secrets":  {Read: permReadMetadata, Write: permReadMetadata},
-		"audit":    {Read: permReadAudit, Write: permAdmin},
+		"audit":    {Read: permReadAudit, Write: permAdmin, ReadActor: ActorUserOnly, WriteActor: ActorUserOnly},
 	},
 	Methods: map[string]string{
 		"/maintainerd.secret.v1.SecretService/Describe": permReadMetadata,
 		"/maintainerd.secret.v1.SecretService/Reveal":   permGetSecret,
 		"/maintainerd.secret.v1.SecretService/Put":      permPutSecret,
+		"/maintainerd.secret.v1.SecretService/Purge":    permDeleteSecret,
+	},
+	MethodActors: map[string]Actor{
+		"/maintainerd.secret.v1.SecretService/Purge": ActorUserOnly,
 	},
 	OperationPermissions: []string{permGetSecret, permPutSecret, permDeleteSecret},
 	BlanketActions:       []string{permAdmin},
@@ -41,10 +54,17 @@ var testMap = Map{
 	ExemptMethods:        []string{"/grpc.health.v1.Health/Check"},
 }
 
-// blanket returns a principal carrying the test map's blanket vocabulary, the way the
-// Guard populates a verified one.
+// blanket returns a USER principal carrying the test map's blanket vocabulary, the way
+// the Guard populates a verified one. The kind is explicit because an actor-constrained
+// surface fails closed on an unclassified caller, which is the correct behaviour and
+// would otherwise make every permission test read as an actor test.
 func blanket(grants ...Grant) *Principal {
-	return &Principal{Grants: grants, BlanketActions: testMap.BlanketActions}
+	return blanketOfKind(ActorKindUser, grants...)
+}
+
+// blanketOfKind is blanket for the tests that care which class of caller is asking.
+func blanketOfKind(kind string, grants ...Grant) *Principal {
+	return &Principal{Kind: kind, Grants: grants, BlanketActions: testMap.BlanketActions}
 }
 
 // ---------------------------------------------------------------------------
@@ -301,16 +321,105 @@ func TestPrincipalFromClaimsReadsBothClaimShapes(t *testing.T) {
 	}
 }
 
-// TestPrincipalFromClaimsDefaultsToServiceKind: mislabelling a workload as a human in
-// the audit trail is the less misleading direction.
-func TestPrincipalFromClaimsDefaultsToServiceKind(t *testing.T) {
-	p := PrincipalFromClaims(&auth.Claims{Subject: "svc-1", Raw: jwt.MapClaims{}})
-	if p.Kind != ActorKindService {
-		t.Errorf("Kind = %q, want %q", p.Kind, ActorKindService)
+// TestActorKindClassification pins the whole classification table, because the answer
+// now decides TWO things — which actor-constrained surfaces a caller reaches, and what
+// an incident review reads in the audit trail's actor_kind column — and a quiet drift
+// in either direction is invisible until it matters.
+func TestActorKindClassification(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  jwt.MapClaims
+		want string
+		why  string
+	}{
+		{
+			name: "the svc claim is decisive",
+			raw:  jwt.MapClaims{ClaimService: "billing-api"},
+			want: ActorKindService,
+			why:  "Auth stamps svc only for a client bound to a service identity, and it is a reserved claim",
+		},
+		{
+			name: "svc beats a contradictory sub_type",
+			raw:  jwt.MapClaims{ClaimService: "billing-api", ClaimSubjectType: "user"},
+			want: ActorKindService,
+			why:  "positive machine evidence wins; a machine that also claims to be a user is still a machine",
+		},
+		{
+			name: "client_credentials with a service binding",
+			raw:  jwt.MapClaims{ClaimSubjectType: "service"},
+			want: ActorKindService,
+		},
+		{
+			name: "client_credentials with no service binding",
+			raw:  jwt.MapClaims{ClaimSubjectType: "client"},
+			want: ActorKindService,
+		},
+		{
+			name: "RFC 8693 token exchange",
+			raw:  jwt.MapClaims{ClaimSubjectType: "exchange"},
+			want: ActorKindService,
+		},
+		{
+			name: "an explicit user",
+			raw:  jwt.MapClaims{ClaimSubjectType: "user"},
+			want: ActorKindUser,
+		},
+		{
+			name: "the device grant is a human on a second screen",
+			raw:  jwt.MapClaims{ClaimSubjectType: "device"},
+			want: ActorKindUser,
+		},
+		{
+			name: "CIBA is a human approving out of band",
+			raw:  jwt.MapClaims{ClaimSubjectType: "ciba"},
+			want: ActorKindUser,
+		},
+		{
+			name: "an unrecognised sub_type falls to the machine side",
+			raw:  jwt.MapClaims{ClaimSubjectType: "some-future-grant"},
+			want: ActorKindService,
+			why:  "an unknown flow must not walk onto a user-only administrative surface",
+		},
+		{
+			name: "neither claim: the shape of an interactive authorization-code login",
+			raw:  jwt.MapClaims{"sid": "session-1"},
+			want: ActorKindUser,
+			why: "maintainerd-auth stamps sub_type on every NON-interactive grant and leaves it " +
+				"absent on authorization_code, so its absence is evidence, not ignorance",
+		},
+		{
+			name: "an empty claim set",
+			raw:  jwt.MapClaims{},
+			want: ActorKindUser,
+		},
+		{
+			name: "a blank svc claim is not evidence",
+			raw:  jwt.MapClaims{ClaimService: "   "},
+			want: ActorKindUser,
+		},
+		{
+			name: "sub_type is matched case-insensitively",
+			raw:  jwt.MapClaims{ClaimSubjectType: "Service"},
+			want: ActorKindService,
+		},
 	}
 
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ActorKindFromClaims(tc.raw); got != tc.want {
+				t.Errorf("ActorKindFromClaims = %q, want %q (%s)", got, tc.want, tc.why)
+			}
+			p := PrincipalFromClaims(&auth.Claims{Subject: "s", Raw: tc.raw})
+			if p.Kind != tc.want {
+				t.Errorf("PrincipalFromClaims Kind = %q, want %q", p.Kind, tc.want)
+			}
+		})
+	}
+}
+
+func TestPrincipalFromClaimsFallbacks(t *testing.T) {
 	// tenant_slug is the fallback tenant claim.
-	p = PrincipalFromClaims(&auth.Claims{Raw: jwt.MapClaims{ClaimTenantSlug: "acme"}})
+	p := PrincipalFromClaims(&auth.Claims{Raw: jwt.MapClaims{ClaimTenantSlug: "acme"}})
 	if p.Tenant != "acme" {
 		t.Errorf("Tenant = %q, want the tenant_slug fallback", p.Tenant)
 	}

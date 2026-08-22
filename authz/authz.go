@@ -19,22 +19,53 @@
 // # Two layers, two different questions
 //
 //  1. THE SURFACE GUARD (Guard.Middleware, Guard.UnaryInterceptor,
-//     Guard.StreamInterceptor). Is the caller authenticated at all, and is the
-//     surface it is calling one this service has decided a permission for? The
-//     route/method Map doubles as an ALLOWLIST: an unmapped surface is DENIED even
-//     to a valid token, so mounting a router or adding an RPC without deciding its
-//     permission fails closed instead of shipping open.
+//     Guard.StreamInterceptor). Is the caller authenticated at all, is the surface it
+//     is calling one this service has decided a Rule for, is this CLASS of caller
+//     allowed on it, and does the caller hold the permission that surface actually
+//     needs? The route/method Map doubles as an ALLOWLIST: an unmapped surface is
+//     DENIED even to a valid token, so mounting a router or adding an RPC without
+//     deciding its permission fails closed instead of shipping open.
+//
+//     THE RULE MUST NAME THE PERMISSION THE SURFACE REALLY PERFORMS. Because this
+//     layer runs FIRST, a deliberately weak "baseline" here is the check an attacker
+//     meets at the door, and a new handler that forgets its layer-2 check inherits
+//     that weakness silently. Declare surfaces exactly (Map.Exact) wherever a segment
+//     mixes privileges; keep the segment pair (Map.Routes) only where the whole
+//     segment genuinely is "browse these, manage these".
 //
 //  2. THE OPERATION CHECK (Principal.Allows). May THIS principal perform THIS action
 //     on THIS resource? This is the one that matters, and it is MRN-level: the
 //     caller's grants are matched against the target's
 //     mrn:<service>:<tenant>:<project>:<resource-path>, which is what makes "may
 //     read staging, must not read prod" expressible at all. A permission check that
-//     stopped at the route would make every grant environment-wide.
+//     stopped at the route would make every grant environment-wide. It is also where
+//     an operation that needs a SECOND permission enforces it — a rollback that both
+//     writes and reads, a folder delete that also deletes the secrets under it.
 //
-// Both are required. Layer 1 without layer 2 is a service where anyone who may touch
-// one resource may touch all of them; layer 2 without layer 1 is a service that
-// answers unauthenticated callers.
+// Both are required, and layer 1 is defence in depth rather than the only defence.
+// Layer 1 without layer 2 is a service where anyone who may touch one resource may
+// touch all of them; layer 2 without layer 1 is a service that answers
+// unauthenticated callers.
+//
+// # Two trust contexts: service-to-service and browser-to-backend
+//
+// Two very different callers reach a resource server, and the distinction is NOT
+// expressible as a permission:
+//
+//   - a USER PRINCIPAL, signed in through an interactive OAuth2 authorization-code +
+//     PKCE flow, driving a console from a browser;
+//   - a SERVICE PRINCIPAL, a machine identity carrying Auth's "svc" claim, calling
+//     m2m with a credential deployed beside it.
+//
+// A permission answers "may this principal do X". The actor kind answers "should this
+// class of caller be doing X at all" — and only the second one can say that a stolen
+// m2m credential, whose grants are entirely real, still has no business creating a
+// project or reading the audit trail, or that a browser session has no business on a
+// path that exists for a workload to fetch its own configuration. Declare it per
+// surface with Actor (ActorAny / ActorUserOnly / ActorServiceOnly); the guard checks
+// it in Check alongside the permission and denies with the distinct DenyActorKind
+// code. Classification comes from the verified claims only (ActorKindFromClaims) and
+// is never taken from anything a caller supplies.
 //
 // # The grant grammar
 //

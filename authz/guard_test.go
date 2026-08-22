@@ -649,3 +649,216 @@ func TestCheckIsTheSingleDecisionPath(t *testing.T) {
 		t.Error("Denial must render as an error")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Exact surfaces: the route guard is the real permission, not a baseline
+// ---------------------------------------------------------------------------
+
+// TestExactRouteWinsOverTheSegmentPair is the whole point of Map.Exact. The
+// "secrets" segment pair says ReadMetadata on both verbs; the reveal and the write
+// declare what they actually do, and a caller holding only the pair's permission is
+// refused at the DOOR rather than deeper in a handler that might forget to ask.
+func TestExactRouteWinsOverTheSegmentPair(t *testing.T) {
+	metadataOnly := enforced(blanket(Grant{Action: permReadMetadata}))
+
+	// The segment pair still governs the routes nobody declared exactly.
+	if w := serve(metadataOnly, request(http.MethodGet, "/api/v1/secrets", "good")); w.Code != http.StatusTeapot {
+		t.Errorf("segment read: status = %d, want the handler to run", w.Code)
+	}
+
+	w := serve(metadataOnly, request(http.MethodPost, "/api/v1/secrets/reveal", "good"))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("reveal with metadata only: status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if !strings.Contains(w.Body.String(), permGetSecret) {
+		t.Errorf("body = %q, want the REVEAL permission named, not the segment baseline", w.Body.String())
+	}
+
+	w = serve(metadataOnly, request(http.MethodPost, "/api/v1/secrets", "good"))
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), permPutSecret) {
+		t.Errorf("write with metadata only: status = %d body = %q, want the WRITE permission demanded",
+			w.Code, w.Body.String())
+	}
+
+	revealer := enforced(blanket(Grant{Action: permGetSecret}))
+	if w := serve(revealer, request(http.MethodPost, "/api/v1/secrets/reveal", "good")); w.Code != http.StatusTeapot {
+		t.Errorf("reveal with GetSecret: status = %d, want the handler to run", w.Code)
+	}
+}
+
+// TestExactKeyNormalisesTheSpellingsOfOneSurface. A router reports "/api/v1/secrets/",
+// a client sends "/api/v1/secrets", and both are the same surface. If they resolved
+// differently, a table written against one spelling would silently fall through to the
+// segment pair for the other — which is exactly the weakening the entry exists to stop.
+func TestExactKeyNormalisesTheSpellingsOfOneSurface(t *testing.T) {
+	want := ExactKey("POST", "/api/v1/secrets")
+	for _, spelling := range []string{"/api/v1/secrets", "/api/v1/secrets/", "/api/v1/secrets//"} {
+		if got := ExactKey("post", spelling); got != want {
+			t.Errorf("ExactKey(post, %q) = %q, want %q", spelling, got, want)
+		}
+	}
+	if got := ExactKey("GET", "/"); got != "GET /" {
+		t.Errorf("ExactKey(GET, /) = %q, want the root path preserved", got)
+	}
+
+	g := enforced(blanket(Grant{Action: permReadMetadata}))
+	for _, spelling := range []string{"/api/v1/secrets", "/api/v1/secrets/"} {
+		w := serve(g, request(http.MethodPost, spelling, "good"))
+		if w.Code != http.StatusForbidden {
+			t.Errorf("POST %q: status = %d, want the exact entry to apply to both spellings",
+				spelling, w.Code)
+		}
+	}
+}
+
+// TestAnUndeclaredNeighbourOfAnExactRouteIsDenied. Dropping a segment from Routes and
+// declaring its routes exactly is STRONGER than a baseline: a new handler mounted
+// beside them is unmapped, so it fails closed instead of inheriting a weak pair.
+func TestAnUndeclaredNeighbourOfAnExactRouteIsDenied(t *testing.T) {
+	m := Map{Prefix: "/api/v1/", Exact: map[string]Rule{
+		"POST /api/v1/vault/reveal": {Permission: permGetSecret},
+	}}
+	if _, ok := m.Resolve(Surface{Path: "/api/v1/vault/exfiltrate", HTTPMethod: http.MethodPost}); ok {
+		t.Error("an undeclared route on a segment with no pair must read as UNMAPPED")
+	}
+	if _, ok := m.Resolve(Surface{Path: "/api/v1/vault/reveal", HTTPMethod: http.MethodGet}); ok {
+		t.Error("an exact entry is method-specific; another verb on the same path is unmapped")
+	}
+}
+
+// TestExactPermissionsAreDeclared: a permission a route can demand must be registered
+// in Auth, or the guard demands something no token can ever carry.
+func TestExactPermissionsAreDeclared(t *testing.T) {
+	declared := strings.Join(testMap.DeclaredPermissions(), " ")
+	for _, p := range []string{permGetSecret, permPutSecret, permDeleteSecret} {
+		if !strings.Contains(declared, p) {
+			t.Errorf("DeclaredPermissions() = %q, missing the exact-route permission %q", declared, p)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The actor check: service-to-service is not browser-to-backend
+// ---------------------------------------------------------------------------
+
+// TestServicePrincipalIsRefusedOnAUserOnlySurface is the stolen-m2m-credential case:
+// the token is valid, the grants are real, and the caller is still the wrong CLASS of
+// caller for an administrative surface.
+func TestServicePrincipalIsRefusedOnAUserOnlySurface(t *testing.T) {
+	workload := enforced(blanketOfKind(ActorKindService, Grant{Action: permAdmin}))
+
+	w := serve(workload, request(http.MethodPost, "/api/v1/secrets/purge", "good"))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if !strings.Contains(w.Body.String(), DenyActorKind) {
+		t.Errorf("body = %q, want the distinct %q code", w.Body.String(), DenyActorKind)
+	}
+	if strings.Contains(w.Body.String(), permDeleteSecret) {
+		t.Error("the actor denial must not name the grant the caller would need — " +
+			"it runs first precisely so a wrong-class caller gets no shopping list")
+	}
+
+	operator := enforced(blanketOfKind(ActorKindUser, Grant{Action: permAdmin}))
+	if w := serve(operator, request(http.MethodPost, "/api/v1/secrets/purge", "good")); w.Code != http.StatusTeapot {
+		t.Errorf("a user principal on the same surface: status = %d, want the handler to run", w.Code)
+	}
+}
+
+// TestUserPrincipalIsRefusedOnAServiceOnlySurface is the other direction: a browser
+// session must not be able to drive a path that exists for a workload.
+func TestUserPrincipalIsRefusedOnAServiceOnlySurface(t *testing.T) {
+	operator := enforced(blanketOfKind(ActorKindUser, Grant{Action: permAdmin}))
+	w := serve(operator, request(http.MethodPost, "/api/v1/secrets/fetch", "good"))
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), DenyActorKind) {
+		t.Errorf("status = %d body = %q, want an actor-kind denial", w.Code, w.Body.String())
+	}
+
+	workload := enforced(blanketOfKind(ActorKindService, Grant{Action: permAdmin}))
+	if w := serve(workload, request(http.MethodPost, "/api/v1/secrets/fetch", "good")); w.Code != http.StatusTeapot {
+		t.Errorf("a service principal on the same surface: status = %d, want the handler to run", w.Code)
+	}
+}
+
+// TestTheSegmentPairCarriesTheActorConstraintPerVerb. Browsing projects is something a
+// workload legitimately does; creating one is console work.
+func TestTheSegmentPairCarriesTheActorConstraintPerVerb(t *testing.T) {
+	workload := enforced(blanketOfKind(ActorKindService, Grant{Action: permAdmin}))
+
+	if w := serve(workload, request(http.MethodGet, "/api/v1/projects", "good")); w.Code != http.StatusTeapot {
+		t.Errorf("read: status = %d, want an unconstrained read to run", w.Code)
+	}
+	if w := serve(workload, request(http.MethodPost, "/api/v1/projects", "good")); w.Code != http.StatusForbidden {
+		t.Errorf("write: status = %d, want the user-only write refused", w.Code)
+	}
+	// The audit segment constrains BOTH verbs.
+	if w := serve(workload, request(http.MethodGet, "/api/v1/audit", "good")); w.Code != http.StatusForbidden {
+		t.Errorf("audit read: status = %d, want the user-only read refused", w.Code)
+	}
+}
+
+// TestAnUnclassifiedPrincipalFailsClosedOnAConstrainedSurface. "We could not tell what
+// this caller is" is not a reason to admit it to a surface somebody restricted.
+func TestAnUnclassifiedPrincipalFailsClosedOnAConstrainedSurface(t *testing.T) {
+	unknown := enforced(&Principal{Grants: []Grant{{Action: permAdmin}}, BlanketActions: testMap.BlanketActions})
+
+	if w := serve(unknown, request(http.MethodPost, "/api/v1/secrets/purge", "good")); w.Code != http.StatusForbidden {
+		t.Errorf("user-only: status = %d, want a refusal", w.Code)
+	}
+	if w := serve(unknown, request(http.MethodPost, "/api/v1/secrets/fetch", "good")); w.Code != http.StatusForbidden {
+		t.Errorf("service-only: status = %d, want a refusal", w.Code)
+	}
+	// ActorAny asked no question, so it admits the caller.
+	if w := serve(unknown, request(http.MethodPost, "/api/v1/secrets/reveal", "good")); w.Code != http.StatusTeapot {
+		t.Errorf("unconstrained: status = %d, want the handler to run", w.Code)
+	}
+}
+
+// TestActorConstraintIsCheckedOnAnOpenSurfaceToo. A surface with no permission is one
+// a service deliberately opened to authenticated callers — it can still be the wrong
+// KIND of caller, and the empty permission must not short-circuit the class check.
+func TestActorConstraintIsCheckedOnAnOpenSurfaceToo(t *testing.T) {
+	m := testMap
+	m.Exact = map[string]Rule{"GET /api/v1/secrets/open": {Actor: ActorUserOnly}}
+	g := Guard{Mode: ModeEnforced, Permissions: m, Service: "secret",
+		Verify: verifier(blanketOfKind(ActorKindService))}
+
+	if w := serve(g, request(http.MethodGet, "/api/v1/secrets/open", "good")); w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want the class check to run before the empty permission short-circuits", w.Code)
+	}
+}
+
+// TestGRPCActorConstraint: MethodActors is the gRPC half of the same statement.
+func TestGRPCActorConstraint(t *testing.T) {
+	const purge = "/maintainerd.secret.v1.SecretService/Purge"
+
+	workload := enforced(blanketOfKind(ActorKindService, Grant{Action: permAdmin}))
+	_, denial := workload.Check(context.Background(), "good", Surface{FullMethod: purge})
+	if denial == nil || denial.Code != DenyActorKind {
+		t.Fatalf("denial = %v, want %q", denial, DenyActorKind)
+	}
+	if denial.GRPCCode != codes.PermissionDenied {
+		t.Errorf("GRPCCode = %v, want PermissionDenied", denial.GRPCCode)
+	}
+
+	operator := enforced(blanketOfKind(ActorKindUser, Grant{Action: permAdmin}))
+	if _, denial := operator.Check(context.Background(), "good", Surface{FullMethod: purge}); denial != nil {
+		t.Errorf("a user principal was denied: %v", denial)
+	}
+
+	// A method with no MethodActors entry is unconstrained.
+	unconstrained := Surface{FullMethod: "/maintainerd.secret.v1.SecretService/Reveal"}
+	if _, denial := workload.Check(context.Background(), "good", unconstrained); denial != nil {
+		t.Errorf("an unconstrained method denied a service principal: %v", denial)
+	}
+}
+
+// TestDevOpenBypassesTheActorCheck. The dev-open principal is attributed to a service
+// subject; if the actor check ran before the mode ladder, every user-only surface in a
+// development stack would answer 403 and the console would look broken rather than open.
+func TestDevOpenBypassesTheActorCheck(t *testing.T) {
+	g := Guard{Mode: ModeDevOpen, Permissions: testMap}
+	if w := serve(g, request(http.MethodPost, "/api/v1/secrets/purge", "")); w.Code != http.StatusTeapot {
+		t.Errorf("status = %d, want dev-open to admit every caller before the map is consulted", w.Code)
+	}
+}

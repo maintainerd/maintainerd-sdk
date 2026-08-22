@@ -71,22 +71,41 @@ identically.
 Two layers, two different questions:
 
 1. **The surface guard** (`Guard.Middleware`, `Guard.UnaryInterceptor`,
-   `Guard.StreamInterceptor`) — is the caller authenticated, and is this surface one
-   the service decided a permission for? The route/method `Map` doubles as an
-   **allowlist**: an unmapped surface is denied even to a valid token, so adding a
-   route without deciding its permission fails closed.
+   `Guard.StreamInterceptor`) — is the caller authenticated, is this surface one the
+   service decided a `Rule` for, is this **class** of caller allowed on it, and does
+   the caller hold the permission the surface actually needs? The route/method `Map`
+   doubles as an **allowlist**: an unmapped surface is denied even to a valid token,
+   so adding a route without deciding its permission fails closed.
 2. **The operation check** (`Principal.Allows`) — MRN-level, in the handler, against
    the target resource. This is what makes "may read staging, must not read prod"
-   expressible at all.
+   expressible at all, and it is where an operation that needs a *second* permission
+   enforces it.
+
+**The route guard must name the permission the surface really performs.** It runs
+*first*, so a deliberately weak "baseline" there is the check an attacker meets at the
+door — and a new handler on the same segment that forgets its layer-2 check inherits
+that weakness silently. Declare a surface **exactly** (`Map.Exact`) wherever a segment
+mixes privileges; keep the segment pair (`Map.Routes`) only where the whole segment
+genuinely is *"browse these, manage these"*.
 
 ```go
 perms := authz.Map{
     Prefix: "/api/v1/",
+    // Exact method + path wins over the segment pair. The "secrets" noun carries a
+    // listing, a write, a reveal and a destroy — one pair could only be as strong as
+    // the weakest of them.
+    Exact: map[string]authz.Rule{
+        "POST /api/v1/secrets/reveal":  {Permission: "secret:GetSecret"},
+        "POST /api/v1/secrets":         {Permission: "secret:PutSecret"},
+        "POST /api/v1/secrets/destroy": {Permission: "secret:DeleteSecret", Actor: authz.ActorUserOnly},
+    },
     Routes: map[string]authz.Perms{
-        "projects": {Read: "secret:ReadMetadata", Write: "secret:ManageProject"},
-        "secrets":  {Read: "secret:ReadMetadata", Write: "secret:ReadMetadata"},
+        // Reads are fine for a workload; creating a project is console work.
+        "projects": {Read: "secret:ReadMetadata", Write: "secret:ManageProject",
+            WriteActor: authz.ActorUserOnly},
     },
     Methods:              map[string]string{"/…/SecretService/Reveal": "secret:GetSecret"},
+    MethodActors:         map[string]authz.Actor{"/…/SecretService/DestroySecret": authz.ActorUserOnly},
     OperationPermissions: []string{"secret:GetSecret", "secret:PutSecret"},
     BlanketActions:       []string{"secret:Admin"},
     ExemptPaths:          []string{"/healthz", "/api/v1/setup"},
@@ -120,6 +139,35 @@ if !p.Allows("secret:GetSecret", targetMRN) { /* 403 */ }
 Both claim shapes Auth can mint are read — the space-separated `scope` string *and*
 the `permissions` array. Reading only one silently authorizes half the fleet.
 
+**Service-to-service and browser-to-backend are checked distinctly.** A permission
+answers *"may this principal do X"*; the **actor kind** answers *"should this class of
+caller be doing X at all"* — and only the second can say that a **stolen m2m
+credential**, whose grants are entirely real, still has no business creating a project
+or reading the audit trail, or that a browser session has no business on a path that
+exists for a workload to fetch its own configuration.
+
+| Constraint | Accepts | Use for |
+|---|---|---|
+| `ActorAny` *(zero value)* | every authenticated caller | anything a console operator **and** a workload legitimately do — reveal, describe, list, batch get |
+| `ActorUserOnly` | `Principal.Kind == "user"` | administrative console surfaces — project/environment/folder management, webhooks, rotation policy, audit read, destroy |
+| `ActorServiceOnly` | `Principal.Kind == "service"` | a path that exists only for a workload |
+
+A refusal carries the distinct `authz.DenyActorKind` code (`actor_kind_not_permitted`)
+rather than `insufficient_permission`: *"you lack a grant"* is fixed by granting it, a
+workload driving the console surface is not a permissions problem at all. The status
+stays **403** / `PermissionDenied` — the reason differs, the answer does not, and a
+distinct status would only tell a prober *why*. The check runs **before** the
+permission check, so a wrong-class caller never gets handed the name of the grant it
+would need.
+
+Classification (`authz.ActorKindFromClaims`) comes from the **verified** claims only:
+an `svc` claim, or `sub_type` ∈ `{service, client, exchange}`, is a machine;
+`{user, device, ciba}` is a human; an *unrecognised* `sub_type` falls to the machine
+side; and **neither claim present** is a human, because Auth stamps `sub_type` on every
+non-interactive grant and leaves it absent on the interactive authorization-code login
+the consoles use. A constrained surface **fails closed** on a principal whose `Kind` is
+empty.
+
 **Registration cannot drift from enforcement.** `Map.DeclaredPermissions()` derives
 the exact permission list setup registers in Auth from the same map the guard
 enforces. Hand-listing it at the registration site is how you get a silent, total API
@@ -138,8 +186,9 @@ is no fourth rung where a partial configuration guesses.
 - `sdk/secret` — client for maintainerd-secret `SecretService`
 - `sdk/auth` — token verification, scope checks, HTTP middleware, OIDC discovery
 - `sdk/authz` — MRN-aware permission enforcement: the grant grammar, the
-  route/method allowlist, HTTP middleware + gRPC interceptors, the
-  `Enforced`/`DevOpen`/`Unavailable` mode ladder, and `DeclaredPermissions()`
+  exact-route / segment / method allowlist, the user-vs-service actor constraint,
+  HTTP middleware + gRPC interceptors, the `Enforced`/`DevOpen`/`Unavailable` mode
+  ladder, and `DeclaredPermissions()`
 - `sdk/mrn` — the `mrn:<service>:<tenant>:<project>:<resource-path>` parser and
   segment-aware matcher (wildcards never span a colon, so a grant for tenant `acme`
   can never reach `acmecorp`). stdlib-only

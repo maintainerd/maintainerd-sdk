@@ -111,6 +111,22 @@ const (
 	DenyInvalidToken    = "invalid_token"
 	DenyUnmappedSurface = "no_permission_mapping"
 	DenyInsufficient    = "insufficient_permission"
+	// DenyActorKind is a caller of the wrong CLASS — a service principal on a
+	// user-only surface, or the reverse. It is a DISTINCT code from
+	// DenyInsufficient on purpose: the two denials mean different things and want
+	// different responses. "You lack a grant" is fixed by granting it; "a workload
+	// is driving the administrative console surface" is not a permissions problem
+	// at all, it is either a misconfigured client or a stolen m2m credential, and
+	// an operator who cannot tell the two apart in a log will try to fix the second
+	// one by widening the first.
+	//
+	// The HTTP status stays 403 and the gRPC code stays PermissionDenied,
+	// deliberately. The REASON differs but the ANSWER does not, and inventing a
+	// distinct status here would only tell a caller probing the surface WHY it was
+	// refused — which is the same oracle argument that keeps every token-verification
+	// failure a flat "invalid token". The distinction belongs in the stable code
+	// field and the audit row, which are read by operators, not by attackers.
+	DenyActorKind = "actor_kind_not_permitted"
 )
 
 // DeclaredPermissions returns every permission this guard can demand — see
@@ -189,7 +205,7 @@ func (g Guard) Check(ctx context.Context, token string, s Surface) (*Principal, 
 		principal = &withBlanket
 	}
 
-	required, mapped := g.Permissions.Required(s)
+	rule, mapped := g.Permissions.Resolve(s)
 	if !mapped {
 		// The allowlist property: an unmapped surface is denied even to a valid token.
 		return nil, &Denial{
@@ -199,6 +215,22 @@ func (g Guard) Check(ctx context.Context, token string, s Surface) (*Principal, 
 			Message:    unmappedMessage(s),
 		}
 	}
+
+	// THE ACTOR CHECK RUNS BEFORE THE PERMISSION CHECK. It is the coarser question —
+	// "should this class of caller be here at all" — and answering it first means a
+	// caller that has no business on the surface never receives the permission-shaped
+	// refusal, which names the exact grant it would need. Refusing a stolen m2m token
+	// with a shopping list is a small leak, but it is a free one to avoid.
+	if !rule.Actor.Permits(principal.Kind) {
+		return nil, &Denial{
+			HTTPStatus: http.StatusForbidden,
+			GRPCCode:   codes.PermissionDenied,
+			Code:       DenyActorKind,
+			Message:    actorMessage(rule.Actor),
+		}
+	}
+
+	required := rule.Permission
 	if required == "" {
 		return principal, nil
 	}
@@ -239,6 +271,21 @@ func (g Guard) unavailable() *Denial {
 		GRPCCode:   codes.Unavailable,
 		Code:       DenyAuthUnavailable,
 		Message:    msg,
+	}
+}
+
+// actorMessage renders the actor denial. It names the class the surface accepts and
+// never the class it decided the caller is: the caller knows what credential it
+// presented, and echoing this service's classification of it would turn the endpoint
+// into a way to ask "what do you think I am".
+func actorMessage(a Actor) string {
+	switch a {
+	case ActorUserOnly:
+		return "this surface accepts user principals only"
+	case ActorServiceOnly:
+		return "this surface accepts service principals only"
+	default:
+		return "this surface does not accept this class of caller"
 	}
 }
 
